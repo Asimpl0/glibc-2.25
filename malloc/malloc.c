@@ -1170,12 +1170,12 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #define mem2chunk(mem) ((mchunkptr)((char*)(mem) - 2*SIZE_SZ))
 
 /* The smallest possible chunk */
-// chunk的最小大小，即包含内存头，fd和bk的大小
+// chunk的最小大小，即包含内存头，fd和bk的大小，不包含fd_nextsize和bk_nextsize
 #define MIN_CHUNK_SIZE        (offsetof(struct malloc_chunk, fd_nextsize))
 
 /* The smallest size we can malloc is an aligned minimal chunk */
 
-// 我们所能分配给用户使用的最小内存大小
+// 我们所能分配给用户使用的最小内存大小，是对齐后的最小chunk
 #define MINSIZE  \
   (unsigned long)(((MIN_CHUNK_SIZE+MALLOC_ALIGN_MASK) & ~MALLOC_ALIGN_MASK))
 
@@ -1866,6 +1866,7 @@ static INTERNAL_SIZE_T global_max_fast;
    optimization at all. (Inlining it in malloc_consolidate is fine though.)
  */
 
+/*初始化arena*/
 static void
 malloc_init_state (mstate av)
 {
@@ -3480,6 +3481,7 @@ _int_malloc (mstate av, size_t bytes)
      can try it without checking, which saves some time on this fast path.
    */
 
+  /*此处在fastbin中分配chunk*/
   // 判断待分配的大小nb是否在fastbin的范围中
   if ((unsigned long) (nb) <= (unsigned long) (get_max_fast ()))
     {
@@ -3499,7 +3501,7 @@ _int_malloc (mstate av, size_t bytes)
              != victim);
       // 获得的victim存在且非空
       if (victim != 0)
-        {
+        { 
           // 当前分配的victim的大小并不在idx中，异常
           if (__builtin_expect (fastbin_index (chunksize (victim)) != idx, 0))
             {
@@ -3531,7 +3533,7 @@ _int_malloc (mstate av, size_t bytes)
     {
       // 获得nb在small bin中的索引
       idx = smallbin_index (nb);
-      // 获得该idx在arena中对应的bin
+      // 获得该idx在arena中对应的bin，实际为包含fd和bk的chunk首地址
       bin = bin_at (av, idx);
 
       // 初始化后bin中没有被分配，bin的fd和bk都是指向自己的
@@ -3589,6 +3591,7 @@ _int_malloc (mstate av, size_t bytes)
     {
       // 获得该大小对应的large bin
       idx = largebin_index (nb);
+      // 存在fastbin，将fastbin进行合并，避免碎片话问题
       if (have_fastchunks (av))
         malloc_consolidate (av);
     }
@@ -3609,12 +3612,13 @@ _int_malloc (mstate av, size_t bytes)
   for (;; )
     {
       int iters = 0;
-      // 从unsorted bin中分配chunk，才有FIFO，先分配bin->bk，即unsorted bin中的最后一块
+      // 从unsorted bin中分配chunk，为有FIFO，先分配bin->bk，即unsorted bin中的最后一块
       // unsorted_chunks (av)->bk) != unsorted_chunks (av)说明unsorted bin不为空
       while ((victim = unsorted_chunks (av)->bk) != unsorted_chunks (av))
         {
-          // bck为victim的前一块bk，fd为bin
+          // bck为victim的前一块bk，victim的fd为bin
           bck = victim->bk;
+          // victim的内存超过了限制
           if (__builtin_expect (chunksize_nomask (victim) <= 2 * SIZE_SZ, 0)
               || __builtin_expect (chunksize_nomask (victim)
 				   > av->system_mem, 0))
@@ -3630,7 +3634,7 @@ _int_malloc (mstate av, size_t bytes)
              exception to best-fit, and applies only when there is
              no exact fit for a small chunk.
            */
-
+          // 待申请的内存大小nb在small bin中，且
           if (in_smallbin_range (nb) &&
               bck == unsorted_chunks (av) &&
               victim == av->last_remainder &&
@@ -4299,7 +4303,7 @@ static void malloc_consolidate(mstate av)
   // 否则合并fastbin到unsorted bin中
   if (get_max_fast () != 0) {
     // fastbin 中的所有chunk不允许合并，故fastbin中的chunk下一个chunk的标记前一个chunk是否被使用的标志物会被置为inuse
-    // 此处要合并fastbin，所以需要清除标记
+    // 此处要合并fastbin，清除arena中的flags，其中包含当前 av 是否包含fastbin
     clear_fastchunks(av);
 
     // 获得unsorted bin
@@ -4327,9 +4331,9 @@ static void malloc_consolidate(mstate av)
     // fastbin上的chunk并不是物理上相邻的，需要合并物理上相邻的前后chunk
     // 对于当前chunk，先合并前一个chunk，将前一个chunk摘链后合并，再合并后一个，若后一个非top，合并后放入unsorted bin，否则成为新的top
 	do {
-    // 检查 p 是否在被使用
+    // 检查 p 是否在被使用，异常会报错
 	  check_inuse_chunk(av, p);
-    // 获得 p 的下一块
+    // 获得 p 的下一块 
 	  nextp = p->fd;
 
 	  /* Slightly streamlined version of consolidation code in free() */
@@ -4347,7 +4351,7 @@ static void malloc_consolidate(mstate av)
 	    prevsize = prev_size (p);
       // 获得合并后的大小
 	    size += prevsize;
-      // 将p执行p的前一个chunk的首地址
+      // 将p指向p的前一个chunk的首地址，即合并后chunk的首地址
 	    p = chunk_at_offset(p, -((long) prevsize));
       // 从av中将p节点摘链，从fastbin中摘链
 	    unlink(av, p, bck, fwd);
