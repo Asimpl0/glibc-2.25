@@ -1040,13 +1040,14 @@ static void*   memalign_check(size_t alignment, size_t bytes,
 
 struct malloc_chunk {
 
-  INTERNAL_SIZE_T      mchunk_prev_size;  /* Size of previous chunk (if free).  */
-  INTERNAL_SIZE_T      mchunk_size;       /* Size in bytes, including overhead. */
+  INTERNAL_SIZE_T      mchunk_prev_size;  /* Size of previous chunk (if free).  */  /* 前一个 chunk 的大小 */
+  INTERNAL_SIZE_T      mchunk_size;       /* Size in bytes, including overhead. */  /* 当前 chunk 的大小 为 内存头 + fd + bk 的大小 */
 
   struct malloc_chunk* fd;         /* double links -- used only if free. */
   struct malloc_chunk* bk;
 
-  /* Only used for large blocks: pointer to next larger size.  */
+  /* Only used for large blocks: pointer to next larger size.  */   
+  /* large bin 中同一 bin 的 chunk 大小是不同的，但是会排序，同一大小的 chunk 可能存在多个，故这俩字段指向前后大小不一样的 chunk */
   struct malloc_chunk* fd_nextsize; /* double links -- used only if free. */
   struct malloc_chunk* bk_nextsize;
 };
@@ -1201,7 +1202,7 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
 /* pad request bytes into a usable size -- internal version */
 
-// 将请求分配的大小转换成加上内存头并对齐后的大小，即chunk大小
+// 将请求分配的大小转换成加上内存头并对齐后的大小，即chunk大小，由于可以使用下一个chunk的SIZE_SZ，此处额外的大小为SIZE_SZ
 #define request2size(req)                                         \
   (((req) + SIZE_SZ + MALLOC_ALIGN_MASK < MINSIZE)  ?             \
    MINSIZE :                                                      \
@@ -1466,7 +1467,7 @@ typedef struct malloc_chunk *mbinptr;
 
     Bins for sizes < 512 bytes contain chunks of all the same size, spaced
     8 bytes apart. Larger bins are approximately logarithmically spaced:
-
+    128 个 bin 的递增间隔，64 位设备上
     64 bins of size       8
     32 bins of size      64
     16 bins of size     512
@@ -1485,11 +1486,13 @@ typedef struct malloc_chunk *mbinptr;
     a valid chunk size the small bins are bumped up one.
  */
 
+// bin 0 不存在，bin 1 为 unsorted bin，small bin 从 2 开始，共 64 个
+
 // small bin中每一个bin里chunk的大小是相同的，不同bin之间的大小按SMALLBIN_WIDTH递增
 
 #define NBINS             128     // 总bin的数量
 #define NSMALLBINS         64     // small bin的数量
-#define SMALLBIN_WIDTH    MALLOC_ALIGNMENT    //每一个small bin间大小的差值
+#define SMALLBIN_WIDTH    MALLOC_ALIGNMENT    //每一个small bin间大小的差值，公差
 #define SMALLBIN_CORRECTION (MALLOC_ALIGNMENT > 2 * SIZE_SZ)
 #define MIN_LARGE_SIZE    ((NSMALLBINS - SMALLBIN_CORRECTION) * SMALLBIN_WIDTH)   // small bin中最大的chunk大小
 
@@ -1497,7 +1500,7 @@ typedef struct malloc_chunk *mbinptr;
 #define in_smallbin_range(sz)  \
   ((unsigned long) (sz) < (unsigned long) MIN_LARGE_SIZE)
 
-// 根据sz获得其所在的small bin的索引
+// 根据sz获得其所在的small bin的索引，直接除以 bin 之间的公差即可，例如 32 字节 即在 32 /16 bin 2 中
 #define smallbin_index(sz) \
   ((SMALLBIN_WIDTH == 16 ? (((unsigned) (sz)) >> 4) : (((unsigned) (sz)) >> 3))\
    + SMALLBIN_CORRECTION)
