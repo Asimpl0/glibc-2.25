@@ -1227,16 +1227,16 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #define PREV_INUSE 0x1
 
 /* extract inuse bit of previous chunk */
-// 判断p的前一个chunk是否在使用
+// 判断p的前一个chunk是否在使用，为 1 时在使用
 #define prev_inuse(p)       ((p)->mchunk_size & PREV_INUSE)
 
 
 /* size field is or'ed with IS_MMAPPED if the chunk was obtained with mmap() */
-// IS_MMAPPED是size的第二位
+// IS_MMAPPED是size的第二位，超过了 mmap_threshold 直接使用 mmap 分配的内存，不在 bin 中 
 #define IS_MMAPPED 0x2
 
 /* check for mmap()'ed chunk */
-// 判断当前内存是否由mmap分配出来
+// 判断当前内存是否由mmap分配出来，为 1 时为 mmap 分配
 #define chunk_is_mmapped(p) ((p)->mchunk_size & IS_MMAPPED)
 
 
@@ -1247,7 +1247,7 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #define NON_MAIN_ARENA 0x4
 
 /* Check for chunk from main arena.  */
-// 判断当前chunk是否在main arena中
+// 判断当前chunk是否在main arena中，为 1 时不在 main_arena
 #define chunk_main_arena(p) (((p)->mchunk_size & NON_MAIN_ARENA) == 0)
 
 /* Mark a chunk as not being on the main arena.  */
@@ -1467,14 +1467,16 @@ typedef struct malloc_chunk *mbinptr;
 
     Bins for sizes < 512 bytes contain chunks of all the same size, spaced
     8 bytes apart. Larger bins are approximately logarithmically spaced:
-    128 个 bin 的递增间隔，64 位设备上
-    64 bins of size       8
-    32 bins of size      64
-    16 bins of size     512
-     8 bins of size    4096
-     4 bins of size   32768
-     2 bins of size  262144
+    128 个 bin 的递增间隔，32 位设备上
+    64 bins of size       8   small bin 中 62 个 bin 的公差
+    32 bins of size      64   large bin 中 32 个 bin 的公差
+    16 bins of size     512   large bin 中 16 个 bin 的公差
+     8 bins of size    4096   large bin 中 8 个 bin 的公差
+     4 bins of size   32768   large bin 中 4 个 bin 的公差
+     2 bins of size  262144   large bin 中 2 个 bin 的公差
      1 bin  of size what's left
+
+     chunk 的大小位于俩 bin 之间的，在前一个 chunk 中
 
     There is actually a little bit of slop in the numbers in bin_index
     for the sake of speed. This makes no difference elsewhere.
@@ -1486,7 +1488,8 @@ typedef struct malloc_chunk *mbinptr;
     a valid chunk size the small bins are bumped up one.
  */
 
-// bin 0 不存在，bin 1 为 unsorted bin，small bin 从 2 开始，共 64 个
+// bin 0 没有使用，bin 1 为 unsorted bin，small bin 从 2 开始，共 62 个
+// bin 0 的作用是给 unsorted bin 留 16 字节做 chunk 起始
 
 // small bin中每一个bin里chunk的大小是相同的，不同bin之间的大小按SMALLBIN_WIDTH递增
 
@@ -1583,6 +1586,8 @@ typedef struct malloc_chunk *mbinptr;
 
 /* Conveniently, the unsorted bin can be used as dummy top on first call */
 // 一开始可以认为unsorted bin即为top
+// 暂时把top chunk初始化为unsort chunk，仅仅是初始化一个值而已，这个chunk的内容肯定不能用于top chunk来分配内存，
+// 主要原因是top chunk不属于任何bin，但ptmalloc中的一些check代码，可能需要top chunk属于一个合法的bin。
 #define initial_top(M)              (unsorted_chunks (M))
 
 /*
@@ -1609,11 +1614,11 @@ typedef struct malloc_chunk *mbinptr;
 // 将bin的索引转换为其所在的map中的bit
 #define idx2bit(i)       ((1U << ((i) & ((1U << BINMAPSHIFT) - 1))))
 
-// 将索引为i的bin的map中对应的bit进行设置
+// 将索引为i的bin的map中对应的bit进行设置，标记为非空闲
 #define mark_bin(m, i)    ((m)->binmap[idx2block (i)] |= idx2bit (i))
-// 将索引为i的bin的map中对应的bit进行清除
+// 将索引为i的bin的map中对应的bit进行清除，标记为空闲
 #define unmark_bin(m, i)  ((m)->binmap[idx2block (i)] &= ~(idx2bit (i)))
-// 获得索引为i的bin的map中对应的bit
+// 获得索引为i的bin的map中对应的bit，为 0 时表示 i 对应的 bin 为空
 #define get_binmap(m, i)  ((m)->binmap[idx2block (i)] & idx2bit (i))
 
 /*
@@ -1642,16 +1647,16 @@ typedef struct malloc_chunk *mfastbinptr;
 #define fastbin(ar_ptr, idx) ((ar_ptr)->fastbinsY[idx])
 
 /* offset 2 to use otherwise unindexable first 2 bins */
-// 根据sz大小获得其所在的fast bin
+// 根据sz大小获得其所在的fast bin，64 位上 fastbin 公差为 16，除 16 - 2 即可得到索引，如 32 在 0 中
 #define fastbin_index(sz) \
   ((((unsigned int) (sz)) >> (SIZE_SZ == 8 ? 4 : 3)) - 2)
 
 
 /* The maximum fastbin request size we support */
-// fastbin中chunk的最大大小
+// fastbin中chunk的最大大小,64 位上为 160
 #define MAX_FAST_SIZE     (80 * SIZE_SZ / 4)
 
-// fast bin的总个数
+// fast bin的总个数，64 位上为 128 / 16 - 2 + 1 = 7 
 #define NFASTBINS  (fastbin_index (request2size (MAX_FAST_SIZE)) + 1)
 
 /*
@@ -1664,7 +1669,9 @@ typedef struct malloc_chunk *mfastbinptr;
    consolidation reduces fragmentation surrounding large chunks even
    if trimming is not used.
  */
-// 合并fast bin 的门限值，40K
+// 合并fast bin 的门限值，64K
+// 当每次释放的chunk与该chunk相邻的空闲chunk合并后的大小大于64k时，就认为内存碎片可能比较多了，
+// 就需要把fast bins中的所有chunk都进行合并，以减少内存碎片对系统的影响。
 #define FASTBIN_CONSOLIDATION_THRESHOLD  (65536UL)
 
 /*
@@ -1682,14 +1689,14 @@ typedef struct malloc_chunk *mfastbinptr;
    initialization checks.
  */
 
-// flags中FASTCHUNKS_BIT标记位为最低位，为1时没有，0时有,用于判断是否存在fastbin
+// flags中FASTCHUNKS_BIT标记位为最低位，为1时没有，0时有,用于判断是否存在fast chunk
 #define FASTCHUNKS_BIT        (1U)
 
 // 通过arena的flags最低位判断是否有fastbin
-#define have_fastchunks(M)     (((M)->flags & FASTCHUNKS_BIT) == 0)、
-// 设置arena的flags最低位为1
+#define have_fastchunks(M)     (((M)->flags & FASTCHUNKS_BIT) == 0)
+// 设置arena的flags最低位为1，没有fastbin
 #define clear_fastchunks(M)    catomic_or (&(M)->flags, FASTCHUNKS_BIT)
-// 设置arena的flags最低位为0
+// 设置arena的flags最低位为0，有fastbin
 #define set_fastchunks(M)      catomic_and (&(M)->flags, ~FASTCHUNKS_BIT)
 
 /*
@@ -1701,7 +1708,8 @@ typedef struct malloc_chunk *mfastbinptr;
    changed dynamically if mmap is ever used as an sbrk substitute.
  */
 
-// flags中NONCONTIGUOUS_BIT标记位为第二位，为1时没有，0时有,用于判断是否返回连续的内存
+// flags中NONCONTIGUOUS_BIT标记位为第二位，为1时不连续，0时连续,用于判断mmap或者sbrk是否返回连续的虚拟内存
+// sbrk时返回的是连续的，mmap是非连续
 #define NONCONTIGUOUS_BIT     (2U)
 
 // 根据flags的第二位是否为0判断是否contiguous，为0时contiguous
@@ -1717,7 +1725,7 @@ typedef struct malloc_chunk *mfastbinptr;
    arena.  Such an arena is no longer used to allocate chunks.  Chunks
    allocated in that arena before detecting corruption are not freed.  */
 
-// flags中ARENA_CORRUPTION_BIT标记位为第三位，为1时异常，0时有,用于判断当前arena是否异常
+// flags中ARENA_CORRUPTION_BIT标记位为第三位，为1时异常，0时正常,用于判断当前arena是否异常，异常时不能用于分配
 #define ARENA_CORRUPTION_BIT (4U)
 
 // 根据flags的第三位判断当前arena是否异常
@@ -1733,6 +1741,7 @@ typedef struct malloc_chunk *mfastbinptr;
  */
 
 // 设置global_max_fast,即最大的fast bin chunk大小,s为0时,设置为最小值,否则进行对齐
+// 64 位上最大的 fastbin chunk 大小为 128B
 #define set_max_fast(s) \
   global_max_fast = (((s) == 0)						      \
                      ? SMALLBIN_WIDTH : ((s + SIZE_SZ) & ~MALLOC_ALIGN_MASK))
@@ -1761,14 +1770,15 @@ struct malloc_state
   mchunkptr top;
 
   /* The remainder from the most recent split of a small request */
-  // 当请求为小块内存时,从大块内存中切割分配后剩余的部分,用于局部性
+  // 当请求为 small chunk 时,从大块内存中切割分配后剩余的部分,用于局部性
   mchunkptr last_remainder;
 
   /* Normal bins packed as described above */
+  // 定义共 128 * 2 - 2 = 254 个 mchunkptr，实际上共 127 个 bin，unsorted 1 small 62 large 63，bin 0 未使用
   mchunkptr bins[NBINS * 2 - 2];
 
   /* Bitmap of bins */
-  // bins的bit map,每个bin对应一bit,表明改bin是否为空
+  // bins的bit map,每个bin对应一bit,表明改bin是否有空闲 chunk
   unsigned int binmap[BINMAPSIZE];
 
   /* Linked list */
@@ -1785,35 +1795,46 @@ struct malloc_state
   INTERNAL_SIZE_T attached_threads;
 
   /* Memory allocated from the system in this arena.  */
-  // 一次从内核请求的内存大小
+  // 当前分配区已经分配的内存大小
   INTERNAL_SIZE_T system_mem;
-  // 最多能申请的内存
+  // 当前分配区最大能分配的内存大小
   INTERNAL_SIZE_T max_system_mem;
 };
 
 struct malloc_par
 {
   /* Tunable parameters */
+  // 收缩阈值，默认 128K，当每个分配区的top chunk大小大于这个阈值时，在一定的条件下，调用free时会收缩
   unsigned long trim_threshold;
+  // 内存分配时是否添加额外的 pad，默认为 0
   INTERNAL_SIZE_T top_pad;
+  // mmap分配阈值，默认值为128KB，64位系统上的最大值为32MB
   INTERNAL_SIZE_T mmap_threshold;
+  // 64位系统上的默认值为8，当每个进程的分配区数量小于等于arena_test时，不会重用已有的分配
   INTERNAL_SIZE_T arena_test;
+  // 保存分配区的最大数量，当系统中的分配区数量达到arena_max，就不会再创建新的分配区
   INTERNAL_SIZE_T arena_max;
 
   /* Memory map support */
+  // 当前进程使用mmap()函数分配的内存块的个数
   int n_mmaps;
+  // 进程使用mmap()函数分配的内存块的最大数量，默认值为 65536
   int n_mmaps_max;
+  // 当前进程使用mmap()函数分配的内存块的数量的最大值，历史总数
   int max_n_mmaps;
   /* the mmap_threshold is dynamic, until the user sets
      it manually, at which point we need to disable any
      dynamic behavior. */
+  // 是否开启mmap分配阈值动态调整机制，默认值为0，默认开启
   int no_dyn_threshold;
 
   /* Statistics */
+  // 用于统计mmap分配的内存大小
   INTERNAL_SIZE_T mmapped_mem;
   INTERNAL_SIZE_T max_mmapped_mem;
 
   /* First address handed out by MORECORE/sbrk.  */
+  // 堆的起始地址
   char *sbrk_base;
 };
 
@@ -1822,7 +1843,7 @@ struct malloc_par
    a static or mmapped malloc_state, you MUST explicitly zero-fill it
    before using. This malloc relies on the property that malloc_state
    is initialized to all zeroes (as is true of C statics).  */
-// 初始化main_arena，因为是static，其余成员会被初始化为0
+// 定义 main_arena，因为是static，其余成员会被初始化为0
 static struct malloc_state main_arena =
 {
   .mutex = _LIBC_LOCK_INITIALIZER,
@@ -1844,7 +1865,7 @@ static mchunkptr dumped_main_arena_end;   /* Exclusive.  */
   ((p) >= dumped_main_arena_start && (p) < dumped_main_arena_end)
 
 /* There is only one instance of the malloc parameters.  */
-
+// 定义 mp_，ptmalloc 的可定义参数
 static struct malloc_par mp_ =
 {
   .top_pad = DEFAULT_TOP_PAD,
@@ -1876,8 +1897,8 @@ malloc_init_state (mstate av)
   int i;
   mbinptr bin;
 
-  /* Establish circular links for normal bins */
-  // 遍历所有的bin
+  /* Establish circular links for normal bins */ 
+  // 遍历所有的bin  
   for (i = 1; i < NBINS; ++i)
     {
       bin = bin_at (av, i);
@@ -1886,15 +1907,18 @@ malloc_init_state (mstate av)
     }
 
 #if MORECORE_CONTIGUOUS
+  // 仅 main_arena sbrk 分配的内存为连续的
   if (av != &main_arena)
 #endif
+  // 设置为非连续
   set_noncontiguous (av);
+  // 仅在初始化 main_arena 时设置 global_max_fast，确保仅初始化一次
   if (av == &main_arena)
     set_max_fast (DEFAULT_MXFAST);
-  //表示arena是否存在fastbin或者内存是否连续等信息
+  // 初始化不存在 fast chunk
   av->flags |= FASTCHUNKS_BIT;
 
-  // 初始化时用unsorted bin作为top chunk
+  // 初始化时用unsorted bin作为top chunk，仅为了后续判断通过
   av->top = initial_top (av);
 }
 
@@ -2010,27 +2034,38 @@ free_perturb (char *p, size_t n)
    Properties of all chunks
  */
 
+// 检查所有类型的 chunk 是否 合法，主要判断地址是否超出范围
 static void
 do_check_chunk (mstate av, mchunkptr p)
 {
+  // 获得 chunk p 的 大小
   unsigned long sz = chunksize (p);
   /* min and max possible addresses assuming contiguous allocation */
+  // 对于连续分配的 av ，实际上就是 main_arena
+  // top chunk 为当前 av 的高地址，加上 top chunk 大小即为当前 av 的最大地址
   char *max_address = (char *) (av->top) + chunksize (av->top);
+  // av->system_mem 为当前 av 已向系统分配的内存大小，相减即为最小地址
   char *min_address = max_address - av->system_mem;
 
+  // 不是 mmap 内存
   if (!chunk_is_mmapped (p))
     {
       /* Has legal address ... */
       if (p != av->top)
         {
+          // p 不是 av 的 top chunk
+          // 如果 p 所在的 av 是连续分配的
           if (contiguous (av))
             {
+              // 判断 p 是否 大于 最小地址，并且没有超过 top chunk
               assert (((char *) p) >= min_address);
               assert (((char *) p + sz) <= ((char *) (av->top)));
             }
         }
       else
         {
+          // p 是 av 的 top chunk
+          // top  chunk 不能小于最小地址，且 top chunk 前一个 chunk 不能是未被使用(未被使用应该合并到 top chunk)
           /* top size is always at least MINSIZE */
           assert ((unsigned long) (sz) >= MINSIZE);
           /* top predecessor always marked inuse */
@@ -2040,8 +2075,10 @@ do_check_chunk (mstate av, mchunkptr p)
   else if (!DUMPED_MAIN_ARENA_CHUNK (p))
     {
       /* address is outside main heap  */
+      // mmap 分配的，且地址在主分配区外
       if (contiguous (av) && av->top != initial_top (av))
         {
+          // av 连续分配，且已经初始化过
           assert (((char *) p) < min_address || ((char *) p) >= max_address);
         }
       /* chunk is page-aligned */
@@ -2055,19 +2092,26 @@ do_check_chunk (mstate av, mchunkptr p)
    Properties of free chunks
  */
 
+// 检测 free chunk，主要是大小和空闲链前后指针判断
 static void
 do_check_free_chunk (mstate av, mchunkptr p)
 {
+  // 获得 chunk p 的大小，未清除 mmap 标志位
   INTERNAL_SIZE_T sz = p->size & ~(PREV_INUSE | NON_MAIN_ARENA);
+  // 获得 chunk p 的下一块 chunk
   mchunkptr next = chunk_at_offset (p, sz);
 
+  // 对 p 的地址进行检查
   do_check_chunk (av, p);
 
   /* Chunk must claim to be free ... */
+  // 判断 p 是否 在使用
   assert (!inuse (p));
+  // 判断 p 是否为 mmap 出来的，mmap 内存不在 bin 中管理，不会是 free chunk
   assert (!chunk_is_mmapped (p));
 
   /* Unless a special marker, must have OK fields */
+  // 判断 p 是否比最小的 chunk 要大，最小为 32B
   if ((unsigned long) (sz) >= MINSIZE)
     {
       assert ((sz & MALLOC_ALIGN_MASK) == 0);
@@ -2075,10 +2119,13 @@ do_check_free_chunk (mstate av, mchunkptr p)
       /* ... matching footer field */
       assert (prev_size (p) == sz);
       /* ... and is fully consolidated */
+      // 前一个未在使用，说明俩空闲没有合并
       assert (prev_inuse (p));
+      // 没有跟下一个合并
       assert (next == av->top || inuse (next));
 
       /* ... and has minimally sane links */
+      // 空闲链指针比较
       assert (p->fd->bk == p);
       assert (p->bk->fd == p);
     }
@@ -2089,36 +2136,46 @@ do_check_free_chunk (mstate av, mchunkptr p)
 /*
    Properties of inuse chunks
  */
-
+// 检查 inuse chunk，主要是检查前后 chunk 的使用，实际上检查的是当前 chunk 内存头
 static void
 do_check_inuse_chunk (mstate av, mchunkptr p)
 {
   mchunkptr next;
 
+  // 检查 p 的地址范围是否合法
   do_check_chunk (av, p);
 
+  // 对于 mmap chunk 不在 bin 中，不做进一步检查
   if (chunk_is_mmapped (p))
     return; /* mmapped chunks have no next/prev */
 
+  // 判断是否在使用
   /* Check whether it claims to be in use ... */
   assert (inuse (p));
 
+  // 获得 p 的下一个 chunk
   next = next_chunk (p);
 
   /* ... and is surrounded by OK chunks.
      Since more things can be checked with free chunks than inuse ones,
      if an inuse chunk borders them and debug is on, it's worth doing them.
    */
+
+  // p 的前一个 chunk 没有被使用
   if (!prev_inuse (p))
     {
       /* Note that we cannot even look at prev unless it is not inuse */
+      // 获得 p 的前一个 chunk
       mchunkptr prv = prev_chunk (p);
+      // 确保前一个 chunk 的下一个 chunk 为 p，实际上是检查 p 的 pre_size
       assert (next_chunk (prv) == p);
       do_check_free_chunk (av, prv);
     }
 
+  // 判断 p 的下一个 chunk 是否是 top chunk
   if (next == av->top)
     {
+      // top chunk 的前一个必须是在使用
       assert (prev_inuse (next));
       assert (chunksize (next) >= MINSIZE);
     }
@@ -2191,6 +2248,7 @@ do_check_malloced_chunk (mstate av, mchunkptr p, INTERNAL_SIZE_T s)
    display chunk addresses, sizes, bins, and other instrumentation.
  */
 
+// 检查 malloc_state，检查 fastbin 和 bins 中内存是否位置正常，标记正常
 static void
 do_check_malloc_state (mstate av)
 {
@@ -2228,6 +2286,7 @@ do_check_malloc_state (mstate av)
 
   max_fast_bin = fastbin_index (get_max_fast ());
 
+  // 遍历所有的 fastbins
   for (i = 0; i < NFASTBINS; ++i)
     {
       p = fastbin (av, i);
@@ -2247,57 +2306,72 @@ do_check_malloc_state (mstate av)
       if (av == &main_arena && i > max_fast_bin)
         assert (p == 0);
 
+      // 遍历当前 bin 中所有的 chunk
       while (p != 0)
         {
           /* each chunk claims to be inuse */
           do_check_inuse_chunk (av, p);
+          // 获得所有 chunk 的总大小
           total += chunksize (p);
           /* chunk belongs in this bin */
+          // 检查当前 chunk 所属的 bin 是否正确
           assert (fastbin_index (chunksize (p)) == i);
           p = p->fd;
         }
     }
 
+  // 判断当前 av 是否存在 fast bin chunk
   if (total != 0)
     assert (have_fastchunks (av));
   else if (!have_fastchunks (av))
     assert (total == 0);
 
+  // 遍历所有的 bin，从 unsorted bin 开始
   /* check normal bins */
   for (i = 1; i < NBINS; ++i)
     {
       b = bin_at (av, i);
 
       /* binmap is accurate (except for bin 1 == unsorted_chunks) */
+      // i >= 2 时为 small bin 和 large bin
       if (i >= 2)
         {
+          // 获得当前 bin 在 mapbit 中的标志位，是否为空
           unsigned int binbit = get_binmap (av, i);
           int empty = last (b) == b;
+          // 检查 bin 的空闲情况是否正常
           if (!binbit)
             assert (empty);
           else if (!empty)
             assert (binbit);
         }
 
+      // b 为 bin 的头节点，p 为 bin 的最后一个节点，遍历该 bin
       for (p = last (b); p != b; p = p->bk)
         {
           /* each chunk claims to be free */
           do_check_free_chunk (av, p);
           size = chunksize (p);
+          // 获得当前 bin 中 chunk 的总大小
           total += size;
+          // 当前 bin 为 small bin 和 large bin，bin 中 chunk 的大小均有要求
           if (i >= 2)
             {
               /* chunk belongs in bin */
+              // 检查当前 chunk 是否应该属于当前 bin
               idx = bin_index (size);
               assert (idx == i);
               /* lists are sorted */
               assert (p->bk == b ||
                       (unsigned long) chunksize (p->bk) >= (unsigned long) chunksize (p));
-
+              
+              // 当前 chunk 在 large bin 中
               if (!in_smallbin_range (size))
                 {
+                  // 当前 chunk 有链接到下一块内存大一些的 chunk
                   if (p->fd_nextsize != NULL)
                     {
+                      // 说明当前 bin 仅有一个 chunk，俩指针必须指向相同
                       if (p->fd_nextsize == p)
                         assert (p->bk_nextsize == p);
                       else
