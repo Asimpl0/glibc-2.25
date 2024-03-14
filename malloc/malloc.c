@@ -1495,7 +1495,7 @@ typedef struct malloc_chunk *mbinptr;
 
 #define NBINS             128     // 总bin的数量
 #define NSMALLBINS         64     // small bin的数量
-#define SMALLBIN_WIDTH    MALLOC_ALIGNMENT    //每一个small bin间大小的差值，公差
+#define SMALLBIN_WIDTH    MALLOC_ALIGNMENT    //每一个small bin间大小的差值，公差，64位上为16
 #define SMALLBIN_CORRECTION (MALLOC_ALIGNMENT > 2 * SIZE_SZ)
 #define MIN_LARGE_SIZE    ((NSMALLBINS - SMALLBIN_CORRECTION) * SMALLBIN_WIDTH)   // small bin中最大的chunk大小
 
@@ -1656,7 +1656,7 @@ typedef struct malloc_chunk *mfastbinptr;
 // fastbin中chunk的最大大小,64 位上为 160
 #define MAX_FAST_SIZE     (80 * SIZE_SZ / 4)
 
-// fast bin的总个数，64 位上为 128 / 16 - 2 + 1 = 7 
+// fast bin的总个数，64 位上为 160 / 16 - 2 + 1 = 9，max_fast 为 128 时仅用了前 7 个
 #define NFASTBINS  (fastbin_index (request2size (MAX_FAST_SIZE)) + 1)
 
 /*
@@ -1741,7 +1741,7 @@ typedef struct malloc_chunk *mfastbinptr;
  */
 
 // 设置global_max_fast,即最大的fast bin chunk大小,s为0时,设置为最小值,否则进行对齐
-// 64 位上最大的 fastbin chunk 大小为 128B
+// 64 位上最大的 fastbin chunk 大小为 128B，该值的调整会决定 fast bin 所能缓存的 chunk 的最大值
 #define set_max_fast(s) \
   global_max_fast = (((s) == 0)						      \
                      ? SMALLBIN_WIDTH : ((s + SIZE_SZ) & ~MALLOC_ALIGN_MASK))
@@ -1810,7 +1810,8 @@ struct malloc_par
   INTERNAL_SIZE_T top_pad;
   // mmap分配阈值，默认值为128KB，64位系统上的最大值为32MB
   INTERNAL_SIZE_T mmap_threshold;
-  // 64位系统上的默认值为8，当每个进程的分配区数量小于等于arena_test时，不会重用已有的分配
+  // 以下俩仅能同时设置一个
+  // 64位系统上的默认值为8，当每个进程的分配区数量小于等于arena_test时，不限制创建 arena，超过了后会限制 arena 数量为 8 * 核数
   INTERNAL_SIZE_T arena_test;
   // 保存分配区的最大数量，当系统中的分配区数量达到arena_max，就不会再创建新的分配区
   INTERNAL_SIZE_T arena_max;
@@ -1872,6 +1873,7 @@ static struct malloc_par mp_ =
   .n_mmaps_max = DEFAULT_MMAP_MAX,
   .mmap_threshold = DEFAULT_MMAP_THRESHOLD,
   .trim_threshold = DEFAULT_TRIM_THRESHOLD,
+  // 即为 8*n
 #define NARENAS_FROM_NCORES(n) ((n) * (sizeof (long) == 4 ? 2 : 8))
   .arena_test = NARENAS_FROM_NCORES (1)
 };
@@ -5116,13 +5118,14 @@ do_set_arena_max (size_t value)
   return 1;
 }
 
-
+// 设置 mp_ 中各个参数，具体含义见 malloc_par 定义
 int
 __libc_mallopt (int param_number, int value)
 {
   mstate av = &main_arena;
   int res = 1;
 
+  // main_arena 需要先初始化
   if (__malloc_initialized < 0)
     ptmalloc_init ();
   __libc_lock_lock (av->mutex);
@@ -5134,6 +5137,7 @@ __libc_mallopt (int param_number, int value)
   switch (param_number)
     {
     case M_MXFAST:
+      // 设置 max_fast 的值，默认为 128，最大为 160
       if (value >= 0 && value <= MAX_FAST_SIZE)
         {
           LIBC_PROBE (memory_mallopt_mxfast, 2, value, get_max_fast ());
