@@ -508,7 +508,7 @@ static char *aligned_heap_area;
    of the page size. */
 
 // 创建一个新的 heap，一次 mmap HEAP_MAX_SIZE，将 size 大小设置为可读可写
-// mmap 的映射需要保证按 HEAP_MAX_SIZE 对齐，因为根据 ptr 获得 heap 直接去掉非对齐部分得到
+// mmap 的映射需要保证按 HEAP_MAX_SIZE 对齐，因为根据 ptr 获得 heap 直接去掉非对齐部分得到 heap_info
 static heap_info *
 internal_function
 new_heap (size_t size, size_t top_pad)
@@ -523,6 +523,7 @@ new_heap (size_t size, size_t top_pad)
   // 即需要申请的大小小于 HEAP_MIN_SIZE 时，按 HEAP_MIN_SIZE 申请
   // 大于 HEAP_MIN_SIZE 时，加上 pad 小于HEAP_MAX_SIZE，按 size+pad 申请
   // 加上 pad 大于 HEAP_MAX_SIZE 且本身没超过 HEAP_MAX_SIZE 时，按 HEAP_MAX_SIZE 申请
+  // size 仅为设置可读可写的大小，实际申请大小为 HEAP_MAX_SIZE
 
   // 即 64 位上  size + pad < 32K,按32K申请
   // 32K < size + pad < 64M,按64M申请
@@ -542,7 +543,7 @@ new_heap (size_t size, size_t top_pad)
      mapping (on Linux, this is the case for all non-writable mappings
      anyway). */
   p2 = MAP_FAILED;
-  // aligned_heap_area 为上次满足对齐时剩下的部分，尝试仍然从改地址映射
+  // aligned_heap_area 为上次满足对齐时剩下的部分，尝试仍然从改地址映射，看能否 mmap HEAP_MAX_SIZE 大小
   if (aligned_heap_area)
     {
       p2 = (char *) MMAP (aligned_heap_area, HEAP_MAX_SIZE, PROT_NONE,
@@ -843,7 +844,7 @@ _int_new_arena (size_t size)
 
 
 /* Remove an arena from free_list.  */
-// 从 free list 中获得一个 空闲 arena
+// 从 free list 中给当前线程获得一个空闲 arena，并将当前线程使用的 arena(如果存在) detach
 static mstate
 get_free_list (void)
 {
@@ -981,6 +982,7 @@ out:
   return result;
 }
 
+// 尝试创建或者从 free arena list 中获得一个 arena
 static mstate
 internal_function
 arena_get2 (size_t size, mstate avoid_arena)
