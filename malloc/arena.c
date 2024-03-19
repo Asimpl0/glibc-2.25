@@ -331,6 +331,7 @@ libc_hidden_proto (_dl_open_hook);
 #endif
 
 // 初始化 ptmalloc，在第一次调用 malloc 时会进行初始化
+// 俩操作，一个将当前线程的 thread_arena 设置为 main_arena，另一个就是初始化 malloc_par mp_
 static void
 ptmalloc_init (void)
 {
