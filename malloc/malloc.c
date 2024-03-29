@@ -1491,7 +1491,7 @@ typedef struct malloc_chunk *mbinptr;
 // bin 0 没有使用，bin 1 为 unsorted bin，small bin 从 2 开始，共 62 个
 // bin 0 的作用是给 unsorted bin 留 16 字节做 chunk 起始
 
-// small bin中每一个bin里chunk的大小是相同的，不同bin之间的大小按SMALLBIN_WIDTH递增
+// small bin中每一个bin里chunk的大小是相同的，不同bin之间的大小按SMALLBIN_WIDTH递增 
 
 #define NBINS             128     // 总bin的数量
 #define NSMALLBINS         64     // small bin的数量
