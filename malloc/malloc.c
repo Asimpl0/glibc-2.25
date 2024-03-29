@@ -1848,7 +1848,7 @@ struct malloc_par
 static struct malloc_state main_arena =
 {
   .mutex = _LIBC_LOCK_INITIALIZER,
-  .next = &main_arena,
+  .next = &main_arena,   // 后续在 main_arena 后面插入 arena 时可以保证新插入的 next 指向 main_arena 形成环
   .attached_threads = 1
 };
 

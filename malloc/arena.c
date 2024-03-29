@@ -55,15 +55,16 @@
 
 // 保存 heap 信息的数据结构，当前数据结构在一个 heap 的起始，仅对非 main_arena 有意义
 // 64位上 heap 每次 mmap 都是按 64M 申请
+// 有了 arena 如果想获得当前 arena 所有的 heap，只需要将当前 arena 指针按 HEAP_MAX_SIZE 向下对齐后获得 heap_info 即可
 typedef struct _heap_info
 {
   // 当前 heap 所属的 arena
   mstate ar_ptr; /* Arena for this heap. */
   // 前一个 heap 的指针
   struct _heap_info *prev; /* Previous heap. */
-  // 当前 heap 使用的大小，字节数
+  // 当前 heap 使用的大小，字节数，已分配使用的大小
   size_t size;   /* Current size in bytes. */
-  // 当前 heap 设置为可读可写的字节数
+  // 当前 heap 设置为可读可写的字节数，实际会大于 size
   size_t mprotect_size; /* Size in bytes that has been mprotected
                            PROT_READ|PROT_WRITE.  */
   /* Make sure the following data is properly aligned, particularly
@@ -130,7 +131,12 @@ int __malloc_initialized = -1;
    is just a hint as to how much memory will be required immediately
    in the new arena. */
 
-// 根据 size 获得 arena，如果线程有已获得的 arena 直接返回该 arena，否则选择空闲或者新建，size在新建时作用
+// 根据 size 获得 arena，如果线程有已获得的 arena 直接返回该 arena，否则选择空闲或者新建或者复用，size在新建时作用
+// 也即：
+// 当前线程有之前在使用的 arena 直接使用该 arena，否则
+// 从 free list 找一个空闲的 arena，否则
+// 判断是否达到 arena 限制数量，没达到直接新建，达到了尝试复用 arena
+// 下面的宏执行完后会返回当前线程要使用的 arena，同时 thread_arena 已被设置
 #define arena_get(ptr, size) do { \
       // 获得当前线程之前获得过的 arena
       ptr = thread_arena;						      \
@@ -604,6 +610,7 @@ new_heap (size_t size, size_t top_pad)
       return 0;
     }
   h = (heap_info *) p2;
+  // 设置当前 heap 分配出去的大小
   h->size = size;
   // 设置当前 heap 设置可读可写的大小
   h->mprotect_size = size;
@@ -613,41 +620,45 @@ new_heap (size_t size, size_t top_pad)
 
 /* Grow a heap.  size is automatically rounded up to a
    multiple of the page size. */
-
+// 将当前 heap 分配出去的内存增加 diff，实际是设置读写属性
 static int
 grow_heap (heap_info *h, long diff)
 {
   size_t pagesize = GLRO (dl_pagesize);
   long new_size;
-
+  // 将 diff 按 pagesize 向上对齐
   diff = ALIGN_UP (diff, pagesize);
+  // 重新计算当前 heap 将要分配出去的大小
   new_size = (long) h->size + diff;
+  // 当前要分配出去的大小已经超过 HEAP_MAX_SIZE 了
   if ((unsigned long) new_size > (unsigned long) HEAP_MAX_SIZE)
     return -1;
-
+  // 当前要分配出去的大小超过了之前设置为可读可写的大小
   if ((unsigned long) new_size > h->mprotect_size)
     {
+      // 将超过的部分设置可读可写属性
       if (__mprotect ((char *) h + h->mprotect_size,
                       (unsigned long) new_size - h->mprotect_size,
                       PROT_READ | PROT_WRITE) != 0)
         return -2;
-
+      // 更新 mprotect_size
       h->mprotect_size = new_size;
     }
-
+  // 更新分配使用的大小
   h->size = new_size;
   LIBC_PROBE (memory_heap_more, 2, h, h->size);
   return 0;
 }
 
 /* Shrink a heap.  */
-
+// 将当前 heap 分配出去的内存减少 diff，实际是设置读写属性
 static int
 shrink_heap (heap_info *h, long diff)
 {
   long new_size;
-
+  // 重新计算当前 heap 将要分配出去的大小
   new_size = (long) h->size - diff;
+  // 减小后的大小已经比 heap_info 部分大小还小了，不能减小
   if (new_size < (long) sizeof (*h))
     return -1;
 
@@ -655,27 +666,29 @@ shrink_heap (heap_info *h, long diff)
      inaccessible.  See malloc-sysdep.h to know when this is true.  */
   if (__glibc_unlikely (check_may_shrink_heap ()))
     {
+      // 将减小 diff 后多出来的部分通过 mmap 设置为 PROT_NONE，不会占用实际的物理内存
       if ((char *) MMAP ((char *) h + new_size, diff, PROT_NONE,
                          MAP_FIXED) == (char *) MAP_FAILED)
         return -2;
-
+      // 更新设置为可读可写的大小
       h->mprotect_size = new_size;
     }
   else
     __madvise ((char *) h + new_size, diff, MADV_DONTNEED);
   /*fprintf(stderr, "shrink %p %08lx\n", h, new_size);*/
-
+  // 更新分配出去的大小
   h->size = new_size;
   LIBC_PROBE (memory_heap_less, 2, h, h->size);
   return 0;
 }
 
 /* Delete a heap. */
-
+// 删除 heap
 #define delete_heap(heap) \
   do {									      \
       if ((char *) (heap) + HEAP_MAX_SIZE == aligned_heap_area)		      \
         aligned_heap_area = NULL;					      \
+      // 直接 unmap 当前 heap
       __munmap ((char *) (heap), HEAP_MAX_SIZE);			      \
     } while (0)
 
@@ -683,6 +696,7 @@ static int
 internal_function
 heap_trim (heap_info *heap, size_t pad)
 {
+  // 获得当前 heap 所在的 malloc_state
   mstate ar_ptr = heap->ar_ptr;
   unsigned long pagesz = GLRO (dl_pagesize);
   mchunkptr top_chunk = top (ar_ptr), p, bck, fwd;
@@ -690,8 +704,10 @@ heap_trim (heap_info *heap, size_t pad)
   long new_size, top_size, top_area, extra, prev_size, misalign;
 
   /* Can this heap go away completely? */
+  // 判断当前 heap 能否完全被删除，因为 arena 没有删除操作，因此只有非 malloc_state 所在的 heap 才能被完全删除
   while (top_chunk == chunk_at_offset (heap, sizeof (*heap)))
     {
+      // 获得当前 heap 的前一个 heap
       prev_heap = heap->prev;
       prev_size = prev_heap->size - (MINSIZE - 2 * SIZE_SZ);
       p = chunk_at_offset (prev_heap, prev_size);
@@ -780,7 +796,7 @@ _int_new_arena (size_t size)
   char *ptr;
   unsigned long misalign;
 
-  // 新建一个非主分配区，heap 需要包含一个 heap_info 和一个 malloc_state
+  // 新建一个非主分配区，heap 需要包含一个 heap_info 和一个 malloc_state(arena 的第一个 heap 需要包含)
   h = new_heap (size + (sizeof (*h) + sizeof (*a) + MALLOC_ALIGNMENT),
                 mp_.top_pad);
   if (!h)
@@ -788,41 +804,57 @@ _int_new_arena (size_t size)
       /* Maybe size is too large to fit in a single heap.  So, just try
          to create a minimally-sized arena and let _int_malloc() attempt
          to deal with the large request via mmap_chunk().  */
+      // 已经无法满足分配了，创建一个最小大小的 heap，仅包含一个 heap_info 和 malloc_state 的大小
+      // 后续分配直接走 mmap
       h = new_heap (sizeof (*h) + sizeof (*a) + MALLOC_ALIGNMENT, mp_.top_pad);
       if (!h)
         return 0;
     }
+  // 获得当前 arena 的 malloc_state，h + 1 按 c 语言数组操作即为 h + 1 * sizeof(*h)，即加上 heap_info 的大小
   a = h->ar_ptr = (mstate) (h + 1);
+  // 初始化 malloc_state
   malloc_init_state (a);
+  // 当前 arean 使用的线程数加 1
   a->attached_threads = 1;
   /*a->next = NULL;*/
+  // 设置当前 arena 已经申请的内存大小为 heap 的大小
   a->system_mem = a->max_system_mem = h->size;
 
   /* Set up the top chunk, with proper alignment. */
+  // a + 1 按 c 语言数组操作即为 a + 1 * sizeof(*a)，即加上 malloc_state 的大小，实际获得 malloc_state 后的起始地址
   ptr = (char *) (a + 1);
+  // 将剩余部分的内存按 MALLOC_ALIGNMENT 对齐
   misalign = (unsigned long) chunk2mem (ptr) & MALLOC_ALIGN_MASK;
   if (misalign > 0)
     ptr += MALLOC_ALIGNMENT - misalign;
+  // 让 arena 的 top chunk 指向 heap 去除 heap_info 和 malloc_state 后的大小
   top (a) = (mchunkptr) ptr;
+  // 设置 top chunk 的内存头，即 size 并将 top chunk 前一个 chunk 设置为 INUSE
   set_head (top (a), (((char *) h + h->size) - ptr) | PREV_INUSE);
 
   LIBC_PROBE (memory_arena_new, 2, a, size);
   mstate replaced_arena = thread_arena;
+  // 设置当前线程使用的 arena 为新分配的 a
   thread_arena = a;
+  // 初始化 a 的锁
   __libc_lock_init (a->mutex);
 
+  // 开始将 a 加到 arena 链中
   __libc_lock_lock (list_lock);
 
   /* Add the new arena to the global list.  */
+  // 将 新建的 a 插入到 main_arena 后面，main_arena 是静态定义的
   a->next = main_arena.next;
   /* FIXME: The barrier is an attempt to synchronize with read access
      in reused_arena, which does not acquire list_lock while
      traversing the list.  */
+  // 涉及到加链操作，确保上面的赋值先执行完成
   atomic_write_barrier ();
   main_arena.next = a;
 
   __libc_lock_unlock (list_lock);
 
+  // 取消当前线程对之前所用的 arena 的使用
   __libc_lock_lock (free_list_lock);
   detach_arena (replaced_arena);
   __libc_lock_unlock (free_list_lock);
@@ -836,7 +868,7 @@ _int_new_arena (size_t size)
      to make it less likely that reused_arena picks this new arena,
      but this could result in a deadlock with
      __malloc_fork_lock_parent.  */
-
+  // 当前 a 已经加入到 arena 链中，防止其他线程 reused 当前 arena
   __libc_lock_lock (a->mutex);
 
   return a;
@@ -909,12 +941,14 @@ remove_from_free_list (mstate arena)
 /* Lock and return an arena that can be reused for memory allocation.
    Avoid AVOID_ARENA as we have already failed to allocate memory in
    it and it is currently locked.  */
+// 复用一个除了 avoid_arena(我们已经从里面分不出来内存了) 以外的 arena
 static mstate
 reused_arena (mstate avoid_arena)
 {
   mstate result;
   /* FIXME: Access to next_to_use suffers from data races.  */
   static mstate next_to_use;
+  // 按顺序复用所有 arena，从 main_arena 开始
   if (next_to_use == NULL)
     next_to_use = &main_arena;
 
@@ -923,24 +957,33 @@ reused_arena (mstate avoid_arena)
   result = next_to_use;
   do
     {
+      // 为了避免 _int_new_arena 刚创建的 arena 被别的线程在这里被复用了，所以在 _int_new_arena 中先 lock 了
+      // next_to_use 没有异常且能够上锁，说明这会儿没有人在用，开始复用该 arena
       if (!arena_is_corrupt (result) && !__libc_lock_trylock (result->mutex))
         goto out;
 
       /* FIXME: This is a data race, see _int_new_arena.  */
+      // 遍历所有 arena
       result = result->next;
     }
+    // arena 链是环
   while (result != next_to_use);
 
   /* Avoid AVOID_ARENA as we have already failed to allocate memory
      in that arena and it is currently locked.   */
+  // 至此我们无法获得一个 arena，要么异常要么拿不到锁
+  // 如果是 avoid_arena，换下一个
   if (result == avoid_arena)
     result = result->next;
 
   /* Make sure that the arena we get is not corrupted.  */
   mstate begin = result;
+  // 遍历所有的 arena，avoid_arena 是已经分配不出来内存的 arena
+  // 找到第一个不是异常或者 avoid_arena 的 arena
   while (arena_is_corrupt (result) || result == avoid_arena)
     {
       result = result->next;
+      // 全部遍历完了没找到一个能用的，已经无法满足分配了
       if (result == begin)
 	/* We looped around the arena list.  We could not find any
 	   arena that was either not corrupted or not the one we
@@ -950,11 +993,14 @@ reused_arena (mstate avoid_arena)
 
   /* No arena available without contention.  Wait for the next in line.  */
   LIBC_PROBE (memory_arena_reuse_wait, 3, &result->mutex, result, avoid_arena);
+  // 到这人 result 是第一个没异常的 arena，上面循环没 goto out 仅仅因为拿不到锁
+  // 这会儿没有没被使用的 arena，直接等待拿锁，等其他线程用完
   __libc_lock_lock (result->mutex);
 
 out:
   /* Attach the arena to the current thread.  */
   {
+    // 至此我们已经拿到了将要使用的 arena 的锁，更新 thread_arena
     /* Update the arena thread attachment counters.   */
     mstate replaced_arena = thread_arena;
     __libc_lock_lock (free_list_lock);
@@ -968,15 +1014,19 @@ out:
        remove the selected arena from the free list.  The caller of
        reused_arena checked the free list and observed it to be empty,
        so the list is very short.  */
+    // 当前我们直接从 main_arena 后面的链里拿到新 arena，可能在 free list 中，摘链
     remove_from_free_list (result);
 
+    // 增加 result 的使用
     ++result->attached_threads;
 
     __libc_lock_unlock (free_list_lock);
   }
 
   LIBC_PROBE (memory_arena_reuse, 2, result, avoid_arena);
+  // 更新当前线程使用的 arena
   thread_arena = result;
+  // 更新下一个被复用的 arena
   next_to_use = result->next;
 
   return result;
@@ -1038,11 +1088,13 @@ arena_get2 (size_t size, mstate avoid_arena)
           // 将 narenas 原子的设置为 n + 1
           if (catomic_compare_and_exchange_bool_acq (&narenas, n + 1, n))
             goto repeat;
+          // 创建一个新的 arena，加入 main_arena 的链中，设置当前线程使用该 arena
           a = _int_new_arena (size);
 	  if (__glibc_unlikely (a == NULL))
             catomic_decrement (&narenas);
         }
       else
+        // 复用一个已经有线程在使用的 arena，设置当前线程使用该 arena
         a = reused_arena (avoid_arena);
     }
   return a;
